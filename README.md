@@ -189,6 +189,19 @@ docker compose restart openclaw
 }
 ```
 
+### 5.3）接入更多云模型（可选）
+
+本仓库已在 `openclaw/openclaw.json` 预置了以下模型（均通过环境变量取 key，不需要在配置中明文写 key）：
+
+- 百炼（DashScope）：`qwen3-max-2026-01-23`、`qwen3-vl-flash-2026-01-22`、`tongyi-xiaomi-analysis-flash`、`tongyi-xiaomi-analysis-pro`、`qwen-flash-character`
+  - Key：`ALI_BAILIAN_DASHSCOPE_API_KEY`
+- Moonshot（Kimi）：`kimi-k2.5`
+  - Key：`MOONSHOT_API_KEY`
+- MiniMax：`MiniMax-M2.1`
+  - Key：`MINIMAX_API_KEY`
+
+默认模型已设置为这批云模型里通常更便宜的 `dashscope/qwen-flash-character`。如果你想“最省钱”，建议把默认模型改回本地 Ollama（`ollama/...`，本地推理不产生云端 token 费用）。
+
 ### 5.2）让对话默认使用中文（兼容旧版本）
 
 部分 Openclaw 版本不支持在 `openclaw.json` 里配置 `agents.defaults.systemPrompt`。更通用的做法是把规则写进工作区引导文件（会注入到系统提示中）：

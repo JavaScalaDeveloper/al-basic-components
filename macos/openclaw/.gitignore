@@ -1,0 +1,28 @@
+# Openclaw runtime/state files (generated)
+agents/
+canvas/
+identity/
+logs/
+memory/
+tasks/
+*.bak
+*.last-good
+exec-approvals.json
+update-check.json
+
+# SQLite runtime artifacts
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+
+# Session artifacts
+*.jsonl
+*.jsonl.reset.*
+*.trajectory.jsonl
+*.trajectory-path.json
+
+# Workspace runtime cache (keep your markdown prompt files)
+workspace/.openclaw/
+workspace/memory/
+workspace/sql-output/
+/openclaw.json.clobbered.*

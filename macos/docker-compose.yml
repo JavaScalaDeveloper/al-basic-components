@@ -1,0 +1,24 @@
+services:
+  # Openclaw (仅部署 Openclaw，远程 Ollama 指向 book-i5-12h)
+#  docker compose up -d openclaw
+#  docker logs openclaw --tail 50
+  # 启动: docker compose --env-file .env up -d
+  # 访问: http://localhost:18789
+  openclaw:
+    image: ghcr.io/openclaw/openclaw:latest
+    container_name: openclaw
+    restart: unless-stopped
+    ports:
+      - "18789:18789"
+      - "18790:18790"
+    environment:
+      - TZ=Asia/Shanghai
+      - OPENCLAW_GATEWAY_TOKEN=${OPENCLAW_GATEWAY_TOKEN}
+      - OLLAMA_API_KEY=ollama-local
+      - ALI_BAILIAN_DASHSCOPE_API_KEY=${ALI_BAILIAN_DASHSCOPE_API_KEY}
+    volumes:
+      # 使用 macos 目录下的 openclaw 配置目录
+      - ./openclaw:/home/node/.openclaw
+      - ./openclaw/workspace:/home/node/.openclaw/workspace
+      # 本地文件落地目录（Mac）映射到容器
+      - ./openclaw/local-files:/data/local-files
