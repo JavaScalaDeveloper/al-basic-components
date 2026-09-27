@@ -1,0 +1,15 @@
+services:
+  starrocks:
+    image: docker.m.daocloud.io/starrocks/allin1-ubuntu:latest
+    container_name: starrocks
+    restart: unless-stopped
+    ports:
+      - "9030:9030"  # MySQL 协议
+      - "8080:8080"  # Stream Load (feproxy)
+      - "8030:8030"  # FE HTTP
+    # 可选：修改 root 密码后重启，需带上同一环境变量
+    # environment:
+    #   - MYSQL_PASSWORD=your_password
+    # 可选：存算分离模式
+    # environment:
+    #   - RUN_MODE=shared_data
