@@ -1,0 +1,1877 @@
+// ==UserScript==
+// @name         百度文库|道客巴巴下载助手
+// @namespace    https://github.com/systemmin/kill-doc
+// @version      1.6.0
+// @description  百度文库/道客巴巴：自动预览按页累积、下载PDF/Word（多页文本+图，Word 可复制）
+// @author       Local
+// @match        https://wenku.baidu.com/*
+// @match        https://wkbjcloudbos.bdimg.com/*
+// @match        https://wkretype.bdimg.com/*
+// @match        https://*.doc88.com/*
+// @require      https://unpkg.com/jspdf@2.4.0/dist/jspdf.umd.min.js
+// @require      https://unpkg.com/@zip.js/zip.js@2.7.34/dist/zip.min.js
+// @run-at       document-idle
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        GM_deleteValue
+// @grant        GM_addStyle
+// @grant        GM_xmlhttpRequest
+// @grant        unsafeWindow
+// @connect      wenku.baidu.com
+// @connect      wkretype.bdimg.com
+// @connect      wkbjcloudbos.bdimg.com
+// @connect      bj.bcebos.com
+// @connect      bdimg.com
+// @connect      baidubce.com
+// @connect      bcebos.com
+// @connect      doc88.com
+// @connect      *.doc88.com
+// @license      Apache-2.0
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    const PREFIX = 'bkwk_';
+    const BOX_ID = PREFIX + 'panel';
+    const BASE_URL = 'https://wkretype.bdimg.com/retype';
+    const WORD_CACHE_KEY = 'SP_pages';
+    const DOC88_XHR_TEXT_KEY = 'doc88_xhr_text';
+    let doc88TextArrayKey = null;
+    let doc88DiscoveredTexts = null;
+
+    const isValidDoc88Paragraph = (text) => {
+        const t = String(text || '').replace(/\s+/g, ' ').trim();
+        if (t.length < 2) return false;
+        if (/^\d+%?$/.test(t)) return false;
+        if (/doc88\.com/i.test(t)) return false;
+        if (/\/ads\//i.test(t)) return false;
+        if (/https?:\/\//i.test(t)) return false;
+        if (!/[\u4e00-\u9fff]/.test(t) && t.length < 50) return false;
+        return true;
+    };
+
+    const sanitizeDoc88Paragraphs = (paras) => {
+        return (paras || [])
+            .map(p => String(p).replace(/\s+/g, ' ').trim())
+            .filter(isValidDoc88Paragraph);
+    };
+
+    GM_addStyle(`
+        #${BOX_ID}{position:fixed;top:50%;right:20px;transform:translateY(-50%);z-index:2147483647;display:flex;flex-direction:column;gap:10px}
+        .${PREFIX}btn{padding:10px 12px;cursor:pointer;border:1px solid #0066ff;border-radius:5px;background:#fff;color:#0066ff;box-shadow:#cfcfcf 1px 1px 9px 3px;font-size:13px}
+        .${PREFIX}active{color:#0a0}
+        #${PREFIX}textarea{width:100%;height:200px;outline:none;padding:10px;box-sizing:border-box;font-size:16px;border:1px solid #ccc;margin-bottom:8px}
+        @media print{#${BOX_ID},#${PREFIX}textarea{display:none!important}}
+        .${PREFIX}copyable,#pageContainer,#pageContainer *{user-select:text!important;-webkit-user-select:text!important}
+    `);
+
+    const ctxProto = CanvasRenderingContext2D.prototype;
+    const rawDrawImage = ctxProto.drawImage;
+    Object.defineProperty(ctxProto, 'drawImage', {
+        value: rawDrawImage,
+        writable: false,
+        configurable: false
+    });
+
+    const rawSetTimeout = unsafeWindow.setTimeout;
+    unsafeWindow.setTimeout = function (callback, delay, ...args) {
+        const s = callback?.toString?.() || '';
+        if (s.includes('revokeObjectURL')) return true;
+        return rawSetTimeout(function () {
+            if (callback instanceof Function) callback(...args);
+        }, delay);
+    };
+
+    const rawAddEventListener = EventTarget.prototype.addEventListener;
+    EventTarget.prototype.addEventListener = function (type, listener, options) {
+        if (type === 'click' && listener.toString().includes('download')) return;
+        return rawAddEventListener.call(this, type, listener, options);
+    };
+
+    class Util {
+        query(sel) { return document.querySelector(sel); }
+        queryAll(sel) { return document.querySelectorAll(sel); }
+        attr(el, key, val) {
+            if (val === undefined) return el.getAttribute(key);
+            el.setAttribute(key, val);
+        }
+        style(el, data) {
+            Object.keys(data || {}).forEach(k => { el.style[k] = data[k]; });
+        }
+        createEl(tag, id) {
+            const el = document.createElement(tag);
+            if (id) el.id = id;
+            return el;
+        }
+        update(id, text) {
+            const el = this.query('#' + PREFIX + id);
+            if (el) el.textContent = text;
+        }
+        sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+        preview(current, total, content) {
+            return new Promise(async resolve => {
+                if (current === -1) {
+                    this.update('text', content || '已完成');
+                    resolve();
+                    return;
+                }
+                const p = Math.min(100, Math.round((current / total) * 100) || 0);
+                this.update('text', '进度 ' + p + '%');
+                await this.sleep(300);
+                resolve();
+            });
+        }
+        gui(buttons, handlers) {
+            if (document.getElementById(BOX_ID)) return;
+            const box = this.createEl('div', '');
+            box.id = BOX_ID;
+            buttons.forEach((b, i) => {
+                if (!b.id) return;
+                const btn = this.createEl('button', PREFIX + b.id);
+                btn.className = PREFIX + 'btn' + (i === 0 ? ' ' + PREFIX + 'active' : '');
+                btn.textContent = b.label;
+                if (handlers?.[b.id]) btn.onclick = handlers[b.id];
+                box.appendChild(btn);
+            });
+            document.body.appendChild(box);
+        }
+    }
+
+    const u = new Util();
+    const { host, href } = location;
+    const params = new URLSearchParams(location.search);
+    const isBaidu = host.includes('wenku.baidu.com');
+    const isDoc88 = host.includes('doc88.com');
+    const isMain = isBaidu || isDoc88;
+    const isChild = isBaidu && !host.includes('wenku.baidu.com');
+
+    let title = document.title;
+    let fileType = 'pdf';
+    let select = '#original-creader-root canvas';
+    let beforeFun = "let eb=u.query('.unfold')||u.query('.read-all');if(eb)eb.click();";
+    let dom = document.documentElement;
+    let interval = null;
+    let downType = 1;
+    let pdfDoc;
+    let zipWriter;
+    let pdfW = 446;
+    let pdfH = 631;
+    let pdfRatio = 0.56;
+    let readerInfoBai = null;
+
+    if (typeof zip !== 'undefined' && zip.configure) {
+        zip.configure({ useWebWorkers: false });
+    }
+
+    const resetWriters = () => {
+        pdfDoc = new jspdf.jsPDF({ orientation: 'p', unit: 'px', compress: true });
+        zipWriter = new zip.ZipWriter(new zip.BlobWriter('application/zip'), {
+            bufferedWrite: true,
+            useCompressionStream: false
+        });
+    };
+    resetWriters();
+
+    const sanitizeTitle = (t) => (t || 'document').replace(/[\\/:*?"<>|]/g, '_').trim();
+    const escapeHtml = (s) => String(s || '')
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+
+    const downloadBlob = (blob, filename) => {
+        const link = document.createElement('a');
+        link.href = URL.createObjectURL(blob);
+        link.download = filename;
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        setTimeout(() => URL.revokeObjectURL(link.href), 2000);
+    };
+
+    const MF_addURL = (urls, key = 'listData', pageIndex = -1) => {
+        const raw = GM_getValue(key) || localStorage.getItem(key) || '[]';
+        let list = JSON.parse(raw);
+        const base = list.length;
+        let n = 0;
+        (urls || []).forEach(url => {
+            const src = typeof url === 'string' ? url : url?.pageLoadUrl || url?.src;
+            if (!src) return;
+            const idx = pageIndex >= 0 ? pageIndex : base + n;
+            const exists = list.find(x => x.src === src);
+            if (!exists) {
+                list.push({ src, page: idx });
+                n++;
+            } else if (pageIndex >= 0 && exists.page !== pageIndex) {
+                exists.page = pageIndex;
+            }
+        });
+        list.sort((a, b) => (a.page ?? 0) - (b.page ?? 0));
+        const json = JSON.stringify(list);
+        localStorage.setItem(key, json);
+        GM_setValue(key, json);
+    };
+
+    const loadWordPageCache = () => {
+        try {
+            return JSON.parse(GM_getValue(WORD_CACHE_KEY) || localStorage.getItem(WORD_CACHE_KEY) || '{}');
+        } catch (e) {
+            return {};
+        }
+    };
+
+    const saveWordPageCache = (cache) => {
+        const json = JSON.stringify(cache);
+        GM_setValue(WORD_CACHE_KEY, json);
+        localStorage.setItem(WORD_CACHE_KEY, json);
+    };
+
+    const mergePageCacheEntry = (pageIndex, { paragraphs, imageSrc, imageDataUrl } = {}) => {
+        if (pageIndex < 0) return;
+        const cache = loadWordPageCache();
+        const k = String(pageIndex);
+        if (!cache[k]) cache[k] = { paragraphs: [], imageSrc: '', imageDataUrl: '' };
+        if (paragraphs?.length) cache[k].paragraphs = sanitizeDoc88Paragraphs(paragraphs);
+        if (imageSrc) {
+            cache[k].imageSrc = imageSrc;
+            MF_addURL([imageSrc], 'listData', pageIndex);
+        }
+        if (imageDataUrl) cache[k].imageDataUrl = imageDataUrl;
+        saveWordPageCache(cache);
+    };
+
+    /** 道客巴巴：单页 canvas 是否已渲染完成 */
+    const isDoc88PageReady = (pageEl) => {
+        if (!pageEl) return false;
+        const prev = pageEl.previousElementSibling?.previousElementSibling;
+        return !prev || !String(prev.innerText || '').trim();
+    };
+
+    const getDoc88Canvas = (pageEl) => {
+        if (!pageEl) return null;
+        if (pageEl.tagName === 'CANVAS') return pageEl;
+        return pageEl.querySelector('canvas');
+    };
+
+    const enableDoc88Copy = () => {
+        try {
+            const copyText = unsafeWindow.copyText;
+            if (typeof copyText === 'function') {
+                const m = copyText.toString().match(/Core\.api\.(.+?)\./);
+                if (m?.[1] && unsafeWindow.Core?.api?.[m[1]]) {
+                    unsafeWindow.Core.api[m[1]].sys = 1;
+                }
+            }
+            if (unsafeWindow.Core?.api?._nk) unsafeWindow.Core.api._nk.sys = 1;
+        } catch (e) { /* ignore */ }
+    };
+
+    const pageTextFromCoreItem = (item) => {
+        if (item == null) return '';
+        if (typeof item === 'string') return item;
+        if (Array.isArray(item)) return item.map(pageTextFromCoreItem).join('');
+        if (typeof item === 'object') {
+            return item.text || item.content || item.txt || item.c || item.body ||
+                item.value || item.str || item.data || item.html || '';
+        }
+        return String(item);
+    };
+
+    const deepScanCoreForPageTexts = () => {
+        if (doc88DiscoveredTexts?.length) return doc88DiscoveredTexts;
+        const core = unsafeWindow.Core;
+        if (!core) return null;
+        let best = null;
+        let bestScore = 0;
+        const seen = new WeakSet();
+        const visit = (obj, depth) => {
+            if (depth > 14 || !obj || typeof obj !== 'object') return;
+            if (seen.has(obj)) return;
+            seen.add(obj);
+            if (Array.isArray(obj) && obj.length >= 1 && obj.length <= 1000) {
+                const mapped = obj.map(pageTextFromCoreItem);
+                const score = mapped.filter(t => isValidDoc88Paragraph(t)).length;
+                if (score > bestScore) {
+                    bestScore = score;
+                    best = mapped;
+                }
+            }
+            for (const k of Object.keys(obj)) {
+                try {
+                    visit(obj[k], depth + 1);
+                } catch (e) { /* ignore */ }
+            }
+        };
+        visit(core, 0);
+        if (best?.length) {
+            doc88DiscoveredTexts = best;
+            console.log('[道客巴巴] Core 深度扫描:', bestScore, '页含正文 / 数组长度', best.length);
+        }
+        return doc88DiscoveredTexts;
+    };
+
+    const hookDoc88CopyCapture = () => {
+        try {
+            if (unsafeWindow.__bkwk_copy_cap) return;
+            const ann = unsafeWindow.Core?.Annotation?.api;
+            if (!ann) return;
+            unsafeWindow.__bkwk_copy_cap = true;
+            let store = ann._sX;
+            Object.defineProperty(ann, '_sX', {
+                configurable: true,
+                enumerable: true,
+                get() { return store; },
+                set(v) {
+                    store = v;
+                    if (!v || !isValidDoc88Paragraph(v)) return;
+                    const idx = Number(localStorage.getItem('SP_index') || '0');
+                    mergePageCacheEntry(Math.max(0, idx), {
+                        paragraphs: splitDenseParagraph(String(v).trim())
+                    });
+                }
+            });
+            if (typeof unsafeWindow.copyText === 'function' && !unsafeWindow.__bkwk_copy_wrap) {
+                unsafeWindow.__bkwk_copy_wrap = true;
+                const orig = unsafeWindow.copyText;
+                unsafeWindow.copyText = function (...args) {
+                    enableDoc88Copy();
+                    const ret = orig.apply(this, args);
+                    const sx = unsafeWindow.Core?.Annotation?.api?._sX;
+                    if (sx && isValidDoc88Paragraph(sx)) {
+                        const idx = Number(localStorage.getItem('SP_index') || '0');
+                        mergePageCacheEntry(Math.max(0, idx), {
+                            paragraphs: splitDenseParagraph(String(sx).trim())
+                        });
+                    }
+                    return ret;
+                };
+            }
+        } catch (e) { /* ignore */ }
+    };
+
+    const tryCoreApiTextForPage = (pageIndex) => {
+        const api = unsafeWindow.Core?.api;
+        if (!api) return [];
+        for (const key of Object.keys(api)) {
+            const fn = api[key];
+            if (typeof fn !== 'function' || fn.length > 4) continue;
+            if (!/(text|copy|char|content|page|word)/i.test(key)) continue;
+            for (const args of [
+                [pageIndex],
+                [pageIndex + 1],
+                [pageIndex, 0, 0, 9999, 9999]
+            ]) {
+                try {
+                    const r = fn.apply(api, args);
+                    const t = pageTextFromCoreItem(r);
+                    if (isValidDoc88Paragraph(t)) return splitDenseParagraph(t);
+                    if (Array.isArray(r)) {
+                        const joined = r.map(pageTextFromCoreItem).filter(isValidDoc88Paragraph).join('\n');
+                        if (joined) return splitDenseParagraph(joined);
+                    }
+                } catch (e) { /* ignore */ }
+            }
+        }
+        return [];
+    };
+
+    const getDoc88TextArray = () => {
+        const api = unsafeWindow.Core?.api;
+        if (!api) return null;
+        if (doc88TextArrayKey && Array.isArray(api[doc88TextArrayKey])) {
+            return api[doc88TextArrayKey];
+        }
+        for (const key of ['_bf', '_VM', '_vm', '_bF', '_Bf']) {
+            const v = api[key];
+            if (Array.isArray(v) && v.some(x => x && String(x).trim().length > 2)) {
+                doc88TextArrayKey = key;
+                return v;
+            }
+        }
+        for (const key of Object.keys(api)) {
+            const v = api[key];
+            if (!Array.isArray(v) || v.length < 1) continue;
+            const hits = v.filter(x => isValidDoc88Paragraph(pageTextFromCoreItem(x)));
+            if (hits.length >= Math.min(2, v.length)) {
+                doc88TextArrayKey = key;
+                return v;
+            }
+        }
+        return Array.isArray(api._bf) ? api._bf : null;
+    };
+
+    const loadDoc88XhrTextMap = () => {
+        try {
+            return JSON.parse(GM_getValue(DOC88_XHR_TEXT_KEY) || localStorage.getItem(DOC88_XHR_TEXT_KEY) || '{}');
+        } catch (e) {
+            return {};
+        }
+    };
+
+    const saveDoc88XhrText = (pageIndex, text) => {
+        if (pageIndex < 0 || !text || !String(text).trim()) return;
+        const map = loadDoc88XhrTextMap();
+        map[String(pageIndex)] = String(text);
+        const json = JSON.stringify(map);
+        GM_setValue(DOC88_XHR_TEXT_KEY, json);
+        localStorage.setItem(DOC88_XHR_TEXT_KEY, json);
+    };
+
+    const getDoc88PageRoot = (pageIndex) => {
+        const n = pageIndex + 1;
+        const byId = document.getElementById('page_' + n);
+        if (byId) return byId.closest('.outer_page') || byId.parentElement;
+        const inners = u.queryAll('#pageContainer .inner_page');
+        const el = inners[pageIndex];
+        if (el) return el.closest('.outer_page') || el.parentElement;
+        return u.queryAll('.outer_page')[pageIndex] || null;
+    };
+
+    const extractDomTextFromPageRoot = (root) => {
+        const container = u.query('#pageContainer');
+        if (!root || !container || !container.contains(root)) return [];
+        const layerSels = [
+            '.textLayer', '.text-layer', '.text_layer', '[class*="textLayer"]',
+            '[class*="TextLayer"]', '.txtlayer', '.page-text', '.page_text'
+        ];
+        for (const sel of layerSels) {
+            const layers = root.querySelectorAll(sel);
+            for (const layer of layers) {
+                const p = sanitizeDoc88Paragraphs(textLayerToParagraphs(layer));
+                if (p.length) return p;
+            }
+        }
+        const spans = [...root.querySelectorAll('span[style*="position"], span[style*="left"]')];
+        if (spans.length >= 3) {
+            const p = sanitizeDoc88Paragraphs(textLayerToParagraphs({
+                querySelectorAll: () => spans,
+                innerText: ''
+            }));
+            if (p.length) return p;
+        }
+        return [];
+    };
+
+    const syncDoc88CoreTextsToCache = () => {
+        deepScanCoreForPageTexts();
+        const discovered = doc88DiscoveredTexts;
+        if (discovered?.length) {
+            discovered.forEach((t, i) => {
+                const raw = pageTextFromCoreItem(t);
+                if (isValidDoc88Paragraph(raw)) {
+                    mergePageCacheEntry(i, { paragraphs: splitDenseParagraph(String(raw).trim()) });
+                }
+            });
+        }
+        const arr = getDoc88TextArray();
+        if (!arr?.length) return;
+        arr.forEach((t, i) => {
+            const raw = pageTextFromCoreItem(t);
+            if (isValidDoc88Paragraph(raw)) {
+                mergePageCacheEntry(i, { paragraphs: splitDenseParagraph(String(raw).trim()) });
+            }
+        });
+    };
+
+    const extractDoc88PageText = (pageIndex, pageEl) => {
+        const cached = sanitizeDoc88Paragraphs(loadWordPageCache()[String(pageIndex)]?.paragraphs);
+        if (cached.length) return cached;
+
+        const xhrMap = loadDoc88XhrTextMap();
+        if (xhrMap[String(pageIndex)]) {
+            return sanitizeDoc88Paragraphs(splitDenseParagraph(xhrMap[String(pageIndex)]));
+        }
+
+        deepScanCoreForPageTexts();
+        if (doc88DiscoveredTexts?.[pageIndex]) {
+            const raw = pageTextFromCoreItem(doc88DiscoveredTexts[pageIndex]);
+            if (isValidDoc88Paragraph(raw)) {
+                return splitDenseParagraph(String(raw).trim());
+            }
+        }
+
+        const arr = getDoc88TextArray();
+        const coreRaw = arr ? pageTextFromCoreItem(arr[pageIndex]) : '';
+        if (isValidDoc88Paragraph(coreRaw)) {
+            return splitDenseParagraph(String(coreRaw).trim());
+        }
+
+        const apiParas = tryCoreApiTextForPage(pageIndex);
+        if (apiParas.length) return apiParas;
+
+        const ann = unsafeWindow.Core?.Annotation?.api;
+        if (ann) {
+            for (const fn of ['getPageText', 'getTextByPage', 'getPageContent', 'getText', 'getSelectText']) {
+                if (typeof ann[fn] === 'function') {
+                    try {
+                        const t = ann[fn](pageIndex);
+                        if (isValidDoc88Paragraph(t)) return splitDenseParagraph(String(t).trim());
+                    } catch (e) { /* ignore */ }
+                }
+            }
+        }
+
+        const root = getDoc88PageRoot(pageIndex) || pageEl?.closest?.('.outer_page');
+        if (root) {
+            const domParas = extractDomTextFromPageRoot(root);
+            if (domParas.length) return domParas;
+        }
+
+        return [];
+    };
+
+    const paragraphsFromDoc88Index = (pageIndex, pageEl) => extractDoc88PageText(pageIndex, pageEl);
+
+    const hookDoc88TextArray = () => {
+        try {
+            const api = unsafeWindow.Core?.api;
+            if (!api || unsafeWindow.__bkwk_doc88_proxy) return;
+            const arr = getDoc88TextArray();
+            if (!arr || !doc88TextArrayKey) return;
+            unsafeWindow.__bkwk_doc88_proxy = true;
+            api[doc88TextArrayKey] = new Proxy(arr, {
+                set(target, prop, value) {
+                    const r = Reflect.set(target, prop, value);
+                    const idx = typeof prop === 'string' && /^\d+$/.test(prop) ? parseInt(prop, 10) : -1;
+                    if (idx >= 0 && isValidDoc88Paragraph(value)) {
+                        mergePageCacheEntry(idx, { paragraphs: splitDenseParagraph(String(value).trim()) });
+                    }
+                    return r;
+                }
+            });
+        } catch (e) { /* ignore */ }
+    };
+
+    const hookDoc88Xhr = () => {
+        if (unsafeWindow.__bkwk_doc88_xhr) return;
+        unsafeWindow.__bkwk_doc88_xhr = true;
+        const _open = unsafeWindow.XMLHttpRequest.prototype.open;
+        unsafeWindow.XMLHttpRequest.prototype.open = function (method, url, ...rest) {
+            const reqUrl = String(url || '');
+            this.addEventListener('load', function () {
+                if (!/doc88\.com/i.test(reqUrl) && !reqUrl.includes('doc88')) return;
+                try {
+                    const body = this.responseText;
+                    if (!body || body.length < 20) return;
+                    let pi = parsePageIndexFromUrl(reqUrl);
+                    if (pi < 0) {
+                        const m = reqUrl.match(/[?&](?:page|pn|p)=(\d+)/i);
+                        if (m) pi = parseInt(m[1], 10) - 1;
+                    }
+                    if (typeof body === 'string' && body.trim().startsWith('{')) {
+                        const data = JSON.parse(body);
+                        const paras = parseJsonPageToParagraphs(data);
+                        if (paras.length) {
+                            saveDoc88XhrText(pi >= 0 ? pi : Object.keys(loadDoc88XhrTextMap()).length, paras.join('\n'));
+                            if (pi >= 0) mergePageCacheEntry(pi, { paragraphs: paras });
+                        }
+                    } else if (typeof body === 'string' && /[\u4e00-\u9fff\w]{4,}/.test(body)) {
+                        const paras = splitDenseParagraph(body.trim());
+                        if (paras.length && pi >= 0) {
+                            saveDoc88XhrText(pi, paras.join('\n'));
+                            mergePageCacheEntry(pi, { paragraphs: paras });
+                        }
+                    }
+                } catch (e) { /* ignore */ }
+            });
+            return _open.apply(this, [method, url, ...rest]);
+        };
+    };
+
+    const parsePageIndexFromUrl = (url) => {
+        if (!url) return -1;
+        const pn = url.match(/[?&]pn=(\d+)/i);
+        if (pn) return parseInt(pn[1], 10) - 1;
+        const pg = url.match(/(?:page|pg)[_-]?(\d+)/i);
+        if (pg) return parseInt(pg[1], 10) - 1;
+        return -1;
+    };
+
+    const getPageIndexFromEl = (el) => {
+        let node = el;
+        while (node && node !== document.body) {
+            const dp = node.getAttribute?.('data-page');
+            if (dp != null && dp !== '') {
+                const n = parseInt(dp, 10);
+                if (!isNaN(n)) return n;
+            }
+            const did = node.getAttribute?.('data-id');
+            if (did != null && /^\d+$/.test(did)) return parseInt(did, 10);
+            const m = node.id?.match(/page[_-]?(\d+)/i);
+            if (m) return parseInt(m[1], 10) - 1;
+            node = node.parentElement;
+        }
+        return -1;
+    };
+
+    const isElementInViewport = (el) => {
+        if (!el?.getBoundingClientRect) return false;
+        const r = el.getBoundingClientRect();
+        const h = window.innerHeight || document.documentElement.clientHeight;
+        return r.top < h && r.bottom > 0;
+    };
+
+    const clearCache = () => {
+        document.querySelectorAll('iframe').forEach(n => n.remove());
+        ['listData', 'length', 'current', 'pageData', 'down', 'SP_text', 'SP_index', 'start', WORD_CACHE_KEY, DOC88_XHR_TEXT_KEY].forEach(k => {
+            localStorage.removeItem(k);
+        });
+        GM_deleteValue('listData');
+        GM_deleteValue(WORD_CACHE_KEY);
+        GM_deleteValue(DOC88_XHR_TEXT_KEY);
+        doc88TextArrayKey = null;
+        doc88DiscoveredTexts = null;
+        resetWriters();
+    };
+
+    const MF_BlobToUint8 = (blob) => new Promise((resolve, reject) => {
+        const fr = new FileReader();
+        fr.onload = () => resolve(new Uint8Array(fr.result));
+        fr.onerror = reject;
+        fr.readAsArrayBuffer(blob);
+    });
+
+    const MF_CanvasToBlob = (canvas) => new Promise(resolve => {
+        const { width, height } = canvas;
+        canvas.toBlob(blob => resolve({ blob, width, height }), 'image/png', 1);
+    });
+
+    const MF_ImageToBase64 = (src) => new Promise((resolve, reject) => {
+        const img = new Image();
+        img.crossOrigin = 'anonymous';
+        img.onload = function () {
+            const canvas = u.createEl('canvas');
+            const { naturalWidth: width, naturalHeight: height } = img;
+            canvas.width = width;
+            canvas.height = height;
+            const ctx = canvas.getContext('2d');
+            ctx.fillStyle = '#FFFFFF';
+            ctx.fillRect(0, 0, width, height);
+            ctx.drawImage(img, 0, 0, width, height);
+            canvas.toBlob(async blob => {
+                const uint8 = await MF_BlobToUint8(blob);
+                resolve({ uint8, blob, width, height, dataUrl: canvas.toDataURL('image/jpeg', 0.9) });
+            }, 'image/png', 1);
+        };
+        img.onerror = reject;
+        let url = src;
+        if (url.startsWith('//')) url = 'https:' + url;
+        if (url.startsWith('http:') && location.protocol === 'https:') url = url.replace('http:', 'https:');
+        img.src = url;
+    });
+
+    const saveImageAndPDF = (imageData, blob, i, width, height) => {
+        let dir = 'p';
+        let tw = pdfW;
+        let th = pdfH;
+        if (width > height) {
+            dir = 'l';
+            th = pdfW;
+            tw = pdfH;
+        }
+        if (blob) zipWriter.add(i + '.png', new zip.BlobReader(blob));
+        pdfDoc.addPage([tw, th], dir);
+        pdfDoc.addImage(imageData, 'JPEG', 0, 0, tw, th, String(i), 'FAST');
+        if (pdfDoc.internal.pages[1]?.length === 2) pdfDoc.deletePage(1);
+    };
+
+    const before = () => {
+        if (beforeFun) eval(beforeFun);
+        if (isBaidu) {
+            u.queryAll('canvas').forEach(eNode => {
+                const ob = new IntersectionObserver(entries => {
+                    if (entries[0].isIntersecting && eNode.width && eNode.height) eNode.id = '';
+                });
+                ob.observe(eNode);
+            });
+        }
+    };
+
+    const parseApiResponse = (respText) => {
+        const t = (respText || '').trim();
+        if (!t) throw new Error('空响应');
+        try {
+            return JSON.parse(t);
+        } catch (e) { /* jsonp / js */ }
+        const p = t.indexOf('(');
+        const q = t.lastIndexOf(')');
+        if (p >= 0 && q > p) {
+            return JSON.parse(t.substring(p + 1, q));
+        }
+        const eq = t.match(/=\s*(\{[\s\S]*\})\s*;?\s*$/);
+        if (eq) return JSON.parse(eq[1]);
+        throw new Error('无法解析响应: ' + t.slice(0, 120));
+    };
+
+    /** 跨域请求：仅用 GM_xmlhttpRequest + @connect，避免篡改猴反复弹窗 */
+    const requestGet = (url) => new Promise((resolve, reject) => {
+        if (typeof GM_xmlhttpRequest !== 'function') {
+            reject(new Error('需要 GM_xmlhttpRequest 权限'));
+            return;
+        }
+        GM_xmlhttpRequest({
+            method: 'GET',
+            url,
+            headers: {
+                Referer: 'https://wenku.baidu.com/',
+                Accept: '*/*'
+            },
+            anonymous: false,
+            onload(res) {
+                if (res.status >= 200 && res.status < 300) {
+                    try {
+                        resolve(parseApiResponse(res.responseText));
+                    } catch (e) {
+                        reject(e);
+                    }
+                } else {
+                    reject(new Error('HTTP ' + res.status));
+                }
+            },
+            onerror: () => reject(new Error('网络错误，请在篡改猴中允许 wkbjcloudbos.bdimg.com 连接'))
+        });
+    });
+
+    /** 从 API JSON 解析段落（保留换行，不拼成一大段） */
+    const parseJsonPageToParagraphs = (resultData) => {
+        let data = resultData;
+        if (data && typeof data === 'object' && !Array.isArray(data) && !data.body && !data.parags) {
+            if (Array.isArray(data.data)) data = data.data;
+            else if (Array.isArray(data.page)) data = data.page;
+            else if (data.pages) data = data.pages;
+        }
+        const paragraphs = [];
+
+        const flushLine = (line) => {
+            const t = (line || '').trim();
+            if (!t) return;
+            splitDenseParagraph(t).forEach(p => paragraphs.push(p));
+        };
+
+        const walkParags = (parags) => {
+            if (!parags?.length) return;
+            let line = '';
+            parags.forEach(p => {
+                if (!p || typeof p.c !== 'string') return;
+                const c = p.c;
+                if (c === '\n' || c === '\r\n' || p.ps === 1 || p.ps === '1') {
+                    flushLine(line);
+                    line = '';
+                } else {
+                    line += c;
+                }
+            });
+            flushLine(line);
+        };
+
+        if (Array.isArray(data)) {
+            data.forEach(block => {
+                if (block?.parags) walkParags(block.parags);
+                else if (typeof block?.c === 'string') flushLine(block.c);
+            });
+        } else if (data?.parags) {
+            walkParags(data.parags);
+        } else if (data?.body) {
+            let line = '';
+            data.body.forEach(item => {
+                if (typeof item.c !== 'string') return;
+                if (item.c === '\n' || item.ps === 1 || item.ps === '1') {
+                    flushLine(line);
+                    line = '';
+                } else {
+                    line += item.c;
+                }
+            });
+            flushLine(line);
+        } else if (typeof data?.c === 'string') {
+            flushLine(data.c);
+        }
+        return paragraphs;
+    };
+
+    /** 无换行符的长段落按题号等再切分 */
+    const splitDenseParagraph = (text) => {
+        if (!text) return [];
+        if (text.includes('\n')) {
+            return text.split(/\n+/).map(s => s.trim()).filter(Boolean);
+        }
+        const byNum = text.split(/(?=\d+[、.．]\s*)|(?=（\d+）)|(?=\(\d+\))/).map(s => s.trim()).filter(Boolean);
+        if (byNum.length > 1) return byNum;
+        return [text];
+    };
+
+    /** 合并写入 pageData/listData，不覆盖预览期间已累积的页 */
+    const syncPageDataFromReader = () => {
+        handleRenderData();
+        const pd = unsafeWindow.pageData;
+        const htmlUrls = pd?.readerInfo?.htmlUrls;
+        let addedJson = 0;
+        let addedPng = 0;
+        if (htmlUrls?.json?.length) {
+            htmlUrls.json.forEach((item, i) => {
+                const src = typeof item === 'string' ? item : item?.pageLoadUrl;
+                if (!src) return;
+                const pi = parsePageIndexFromUrl(src);
+                MF_addURL([src], 'pageData', pi >= 0 ? pi : i);
+                addedJson++;
+            });
+        }
+        if (htmlUrls?.png?.length) {
+            htmlUrls.png.forEach((item, i) => {
+                const src = typeof item === 'string' ? item : item?.pageLoadUrl;
+                if (!src) return;
+                const pi = parsePageIndexFromUrl(src);
+                MF_addURL([src], 'listData', pi >= 0 ? pi : i);
+                addedPng++;
+            });
+        } else if (htmlUrls && !htmlUrls.png && !htmlUrls.json) {
+            const arr = Array.isArray(htmlUrls) ? htmlUrls : [htmlUrls];
+            arr.forEach((item, i) => {
+                const src = typeof item === 'string' ? item : item?.pageLoadUrl;
+                if (src) MF_addURL([src], 'listData', i);
+            });
+        }
+        const totalJson = getPageDataList().length;
+        const totalPng = getPngList().length;
+        if (addedJson || addedPng) {
+            console.log('[百度文库] 合并 pageData', totalJson, '条, 页图', totalPng, '张 (本批 +', addedJson, '/', addedPng, ')');
+        }
+    };
+
+    const capturePageUrlFromXhr = (url) => {
+        if (!url || typeof url !== 'string') return;
+        const u = url.split('?')[0];
+        if (/wkbjcloudbos\.bdimg\.com/i.test(url) && /\.json/i.test(u)) {
+            const pi = parsePageIndexFromUrl(url);
+            MF_addURL([url], 'pageData', pi);
+            return;
+        }
+        if (/wkbjcloudbos\.bdimg\.com/i.test(url) && /\.(png|jpg|jpeg|webp)/i.test(u)) {
+            const pi = parsePageIndexFromUrl(url);
+            MF_addURL([url], 'listData', pi);
+        }
+    };
+
+    const accumulatePageAtIndex = (pageIndex, layer, canvas) => {
+        if (pageIndex < 0) return;
+        let paragraphs = [];
+        if (layer) paragraphs = textLayerToParagraphs(layer);
+        let imageSrc = '';
+        if (canvas) {
+            imageSrc = u.attr(canvas, 'data-src') || canvas.src || '';
+            if (imageSrc.startsWith('//')) imageSrc = 'https:' + imageSrc;
+            if (imageSrc.startsWith('http:') && location.protocol === 'https:') {
+                imageSrc = imageSrc.replace('http:', 'https:');
+            }
+        }
+        if (!paragraphs.length && !imageSrc) return;
+        mergePageCacheEntry(pageIndex, { paragraphs, imageSrc: imageSrc && !imageSrc.startsWith('data:') ? imageSrc : '' });
+    };
+
+    const accumulateVisiblePages = () => {
+        u.queryAll('#original-creader-root canvas').forEach((canvas, fallbackIndex) => {
+            const pageIndex = getPageIndexFromEl(canvas);
+            const idx = pageIndex >= 0 ? pageIndex : fallbackIndex;
+            const host = canvas.closest('[data-page], [data-id]') || canvas.parentElement;
+            const layer = host?.querySelector?.('.textLayer');
+            accumulatePageAtIndex(idx, layer, canvas);
+        });
+    };
+
+    const getPngList = () => {
+        try {
+            const raw = GM_getValue('listData') || localStorage.getItem('listData') || '[]';
+            return JSON.parse(raw);
+        } catch (e) {
+            return [];
+        }
+    };
+
+    const fetchImageDataUrl = (url) => new Promise((resolve, reject) => {
+        GM_xmlhttpRequest({
+            method: 'GET',
+            url: normalizeUrl(url),
+            responseType: 'arraybuffer',
+            headers: { Referer: 'https://wenku.baidu.com/', Accept: 'image/*,*/*' },
+            anonymous: false,
+            onload(res) {
+                if (res.status < 200 || res.status >= 300) {
+                    reject(new Error('HTTP ' + res.status));
+                    return;
+                }
+                const blob = new Blob([res.response]);
+                const fr = new FileReader();
+                fr.onload = () => resolve(fr.result);
+                fr.onerror = reject;
+                fr.readAsDataURL(blob);
+            },
+            onerror: reject
+        });
+    });
+
+    const normalizeUrl = (url) => {
+        if (!url) return '';
+        if (url.startsWith('//')) return 'https:' + url;
+        if (url.startsWith('http:') && location.protocol === 'https:') return url.replace('http:', 'https:');
+        return url;
+    };
+
+    const compressDataUrl = (dataUrl, maxW = 520, quality = 0.82) => new Promise((resolve, reject) => {
+        const img = new Image();
+        img.onload = () => {
+            let w = img.naturalWidth;
+            let h = img.naturalHeight;
+            if (w > maxW) {
+                h = Math.round(h * maxW / w);
+                w = maxW;
+            }
+            const c = u.createEl('canvas');
+            c.width = w;
+            c.height = h;
+            const ctx = c.getContext('2d');
+            ctx.fillStyle = '#FFFFFF';
+            ctx.fillRect(0, 0, w, h);
+            ctx.drawImage(img, 0, 0, w, h);
+            resolve(c.toDataURL('image/jpeg', quality));
+        };
+        img.onerror = reject;
+        img.src = dataUrl;
+    });
+
+    const getPageDataList = () => {
+        try {
+            const raw = GM_getValue('pageData') || localStorage.getItem('pageData') || '[]';
+            const list = JSON.parse(raw);
+            return Array.isArray(list) ? list : [];
+        } catch (e) {
+            return [];
+        }
+    };
+
+    const textLayerToParagraphs = (textLayer) => {
+        if (!textLayer) return [];
+        const spans = [...textLayer.querySelectorAll('span')];
+        if (!spans.length) {
+            return (textLayer.innerText || '').split(/\n+/).map(s => s.trim()).filter(Boolean);
+        }
+        const lineMap = new Map();
+        spans.forEach(span => {
+            const t = span.textContent;
+            if (!t?.trim()) return;
+            const top = Math.round(parseFloat(span.style.top) || 0);
+            const left = parseFloat(span.style.left) || 0;
+            if (!lineMap.has(top)) lineMap.set(top, []);
+            lineMap.get(top).push({ left, text: t });
+        });
+        return [...lineMap.entries()]
+            .sort((a, b) => a[0] - b[0])
+            .map(([, parts]) => parts.sort((a, b) => a.left - b.left).map(p => p.text).join(''))
+            .filter(Boolean);
+    };
+
+    const getPageDataByIndex = () => {
+        const map = {};
+        getPageDataList().forEach((item, i) => {
+            const idx = typeof item.page === 'number' ? item.page : i;
+            if (item.src) map[idx] = item.src;
+        });
+        return map;
+    };
+
+    const getPngByIndex = () => {
+        const map = {};
+        getPngList().forEach((item, i) => {
+            const idx = typeof item.page === 'number' ? item.page : i;
+            if (item.src) map[idx] = item.src;
+        });
+        return map;
+    };
+
+    const resolvePageCount = () => {
+        const cache = loadWordPageCache();
+        let max = 0;
+        Object.keys(cache).forEach(k => {
+            const n = parseInt(k, 10);
+            if (n >= 0 && n + 1 > max) max = n + 1;
+        });
+        getPageDataList().forEach((item, i) => {
+            const idx = (typeof item.page === 'number' ? item.page : i) + 1;
+            if (idx > max) max = idx;
+        });
+        getPngList().forEach((item, i) => {
+            const idx = (typeof item.page === 'number' ? item.page : i) + 1;
+            if (idx > max) max = idx;
+        });
+        return Math.max(max, 1);
+    };
+
+    const collectBaiduWordContent = async () => {
+        stopPreview();
+        before();
+        await u.sleep(500);
+        accumulateVisiblePages();
+        syncPageDataFromReader();
+
+        const cache = loadWordPageCache();
+        const pageDataMap = getPageDataByIndex();
+        const pngMap = getPngByIndex();
+        const pageCount = resolvePageCount();
+
+        const pages = [];
+        for (let i = 0; i < pageCount; i++) {
+            const cached = cache[String(i)] || {};
+            let paragraphs = cached.paragraphs?.length ? [...cached.paragraphs] : [];
+
+            const jsonSrc = pageDataMap[i];
+            if (jsonSrc) {
+                try {
+                    const data = await requestGet(jsonSrc);
+                    const apiParas = parseJsonPageToParagraphs(data);
+                    const apiLen = apiParas.join('').length;
+                    const curLen = paragraphs.join('').length;
+                    if (apiParas.length > paragraphs.length || apiLen > curLen * 1.05) {
+                        paragraphs = apiParas;
+                    }
+                } catch (e) {
+                    console.warn('[Word] 文本 API 第', i + 1, '页:', e.message || e);
+                }
+            }
+
+            const images = [];
+            const pngSrc = cached.imageSrc || pngMap[i];
+            if (cached.imageDataUrl) {
+                images.push({ dataUrl: cached.imageDataUrl, width: 480 });
+            } else if (pngSrc) {
+                try {
+                    const raw = await fetchImageDataUrl(pngSrc);
+                    images.push({
+                        dataUrl: await compressDataUrl(raw),
+                        width: 480
+                    });
+                } catch (e) {
+                    console.warn('[Word] 页图第', i + 1, '页失败:', e.message || e);
+                }
+            }
+
+            if (paragraphs.length || images.length) {
+                pages.push({ paragraphs, images });
+            }
+            await u.preview(i + 1, pageCount);
+        }
+
+        if (!pages.length) {
+            const editor = u.query('.ql-editor');
+            if (editor?.innerText?.trim()) {
+                pages.push({
+                    paragraphs: editor.innerText.split(/\n+/).map(s => s.trim()).filter(Boolean),
+                    images: []
+                });
+            }
+        }
+
+        const cachedPages = Object.keys(cache).length;
+        const apiPages = getPageDataList().length;
+        console.log('[Word] 导出', pages.length, '页 | 预览缓存', cachedPages, '页 | API', apiPages, '条');
+        if (pages.length <= apiPages && apiPages <= 3 && cachedPages < 3) {
+            console.warn('[Word] 接口仅提供', apiPages, '页试读地址；请先「自动预览」滚完全文以按页缓存更多内容');
+        }
+        return pages;
+    };
+
+    const accumulateDoc88PageAtIndex = async (pageIndex, pageEl) => {
+        if (pageIndex < 0 || !isDoc88PageReady(pageEl)) return;
+        pageEl.scrollIntoView?.({ behavior: 'instant', block: 'center' });
+        await u.sleep(400);
+        syncDoc88CoreTextsToCache();
+        hookDoc88TextArray();
+        let paragraphs = extractDoc88PageText(pageIndex, pageEl);
+        const canvas = getDoc88Canvas(pageEl);
+        let imageDataUrl = '';
+        if (canvas?.width && canvas?.height) {
+            try {
+                const { blob } = await MF_CanvasToBlob(canvas);
+                const fr = new FileReader();
+                imageDataUrl = await new Promise((res, rej) => {
+                    fr.onload = () => res(fr.result);
+                    fr.onerror = rej;
+                    fr.readAsDataURL(blob);
+                });
+                imageDataUrl = await compressDataUrl(imageDataUrl);
+            } catch (e) {
+                console.warn('[道客巴巴] 第', pageIndex + 1, '页截图失败:', e.message || e);
+            }
+        }
+        if (!paragraphs.length && !imageDataUrl) return;
+        mergePageCacheEntry(pageIndex, { paragraphs, imageDataUrl });
+    };
+
+    const accumulateDoc88VisiblePages = () => {
+        syncDoc88CoreTextsToCache();
+        u.queryAll(select).forEach((pageEl, i) => {
+            if (!isDoc88PageReady(pageEl)) return;
+            const paragraphs = extractDoc88PageText(i, pageEl);
+            if (paragraphs.length) mergePageCacheEntry(i, { paragraphs });
+        });
+    };
+
+    const collectDoc88WordContent = async () => {
+        stopPreview();
+        before();
+        enableDoc88Copy();
+        hookDoc88CopyCapture();
+        syncDoc88CoreTextsToCache();
+        await u.sleep(400);
+        accumulateDoc88VisiblePages();
+
+        const cache = loadWordPageCache();
+        const canvasCount = u.queryAll(select).length;
+        const coreArr = getDoc88TextArray();
+        const pageCount = Math.max(
+            resolvePageCount(),
+            canvasCount,
+            coreArr?.length || 0,
+            u.queryAll('.outer_page').length
+        );
+
+        const pages = [];
+        for (let i = 0; i < pageCount; i++) {
+            const cached = cache[String(i)] || {};
+            const pageEl = u.queryAll(select)[i];
+            let paragraphs = cached.paragraphs?.length ? [...cached.paragraphs] : extractDoc88PageText(i, pageEl);
+
+            const images = [];
+            if (cached.imageDataUrl) {
+                images.push({ dataUrl: cached.imageDataUrl, width: 480 });
+            } else if (pageEl && isDoc88PageReady(pageEl)) {
+                    await accumulateDoc88PageAtIndex(i, pageEl);
+                    const again = loadWordPageCache()[String(i)];
+                    if (again?.imageDataUrl) {
+                        images.push({ dataUrl: again.imageDataUrl, width: 480 });
+                    }
+                    if (again?.paragraphs?.length && again.paragraphs.join('').length > paragraphs.join('').length) {
+                        paragraphs = again.paragraphs;
+                    }
+            }
+
+            if (!paragraphs.length && pageEl) {
+                paragraphs = extractDoc88PageText(i, pageEl);
+            }
+
+            const cleanParas = sanitizeDoc88Paragraphs(paragraphs);
+            if (cleanParas.length || images.length) {
+                pages.push({ paragraphs: cleanParas, images });
+            }
+            await u.preview(i + 1, pageCount);
+        }
+
+        if (!pages.length) {
+            syncDoc88CoreTextsToCache();
+            const texts = doc88DiscoveredTexts || getDoc88TextArray();
+            if (texts?.length) {
+                texts.forEach((t) => {
+                    const raw = pageTextFromCoreItem(t);
+                    const paras = sanitizeDoc88Paragraphs(splitDenseParagraph(String(raw || '').trim()));
+                    if (paras.length) pages.push({ paragraphs: paras, images: [] });
+                });
+            }
+        }
+
+        const totalChars = pages.reduce((n, p) => n + sanitizeDoc88Paragraphs(p.paragraphs).join('').length, 0);
+        console.log('[道客巴巴] Word 导出', pages.length, '页,', totalChars, '字, 缓存', Object.keys(loadWordPageCache()).length, '页');
+        if (pages.length && totalChars < 20) {
+            const api = unsafeWindow.Core?.api || {};
+            const arrKeys = Object.keys(api).filter(k => Array.isArray(api[k]));
+            console.warn('[道客巴巴] 未提取到正文。Core 文本键:', doc88TextArrayKey || '无', '| api 数组字段:', arrKeys);
+        }
+        return pages;
+    };
+
+    const parseImageDoc88 = async () => {
+        const items = u.queryAll(select);
+        if (!items.length) {
+            alert('暂无页面数据，请先自动预览');
+            return;
+        }
+        resetWriters();
+        let saved = 0;
+        for (let i = 0; i < items.length; i++) {
+            const item = items[i];
+            if (!isDoc88PageReady(item)) continue;
+            const canvas = getDoc88Canvas(item);
+            if (!canvas) continue;
+            try {
+                const { blob, width, height } = await MF_CanvasToBlob(canvas);
+                saveImageAndPDF(canvas, blob, saved, width, height);
+                saved++;
+                await u.preview(i + 1, items.length);
+            } catch (e) {
+                console.warn('[道客巴巴] 第', i + 1, '页:', e.message || e);
+            }
+        }
+        if (!saved) {
+            alert('没有可导出的页面，请先自动预览并等待各页加载完成');
+            return;
+        }
+        conditionDownload();
+    };
+
+    const scrollPreviewDoc88Tick = async () => {
+        if (!localStorage.getItem('start')) {
+            u.preview(-1, null, '已终止');
+            return;
+        }
+        before();
+        const pages = u.queryAll(select);
+        const length = pages.length;
+        if (!length) {
+            stopPreview();
+            u.preview(-1);
+            return;
+        }
+        const i = Number(localStorage.getItem('SP_index') || '0');
+        if (i >= length) {
+            stopPreview();
+            u.preview(-1);
+            localStorage.removeItem('SP_index');
+            console.log('[道客巴巴] 预览完成, 已缓存', Object.keys(loadWordPageCache()).length, '页');
+            return;
+        }
+        const current = pages[i];
+        if (isDoc88PageReady(current)) {
+            await accumulateDoc88PageAtIndex(i, current);
+            if (i < length - 1) {
+                pages[i + 1].scrollIntoView({ behavior: 'smooth', block: 'center' });
+            }
+        } else {
+            current.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        }
+        await u.preview(i + 1, length);
+        localStorage.setItem('SP_index', String(i + 1));
+        setTimeout(scrollPreviewDoc88Tick, 500);
+    };
+
+    const scrollPageAreaDoc88 = () => {
+        before();
+        let end = 0;
+        const pages = u.queryAll(select);
+        const length = pages.length;
+        const startNum = (Number(u.query('#pageNumInput')?.value) || 1) - 1;
+        for (let i = startNum; i < length; i++) {
+            const item = pages[i];
+            const prev = item.previousElementSibling?.previousElementSibling;
+            const t = prev ? String(prev.innerText || '') : '';
+            if (t.length !== 0) {
+                end = 1;
+                item.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                u.preview(i + 1, length);
+                accumulateDoc88VisiblePages();
+                break;
+            }
+        }
+        if (end === 0) {
+            u.preview(-1);
+            stopPreview();
+            accumulateDoc88VisiblePages();
+        }
+    };
+
+    const collectDoc88TextPages = async () => {
+        enableDoc88Copy();
+        hookDoc88CopyCapture();
+        syncDoc88CoreTextsToCache();
+        const pageCount = Math.max(
+            u.queryAll(select).length,
+            u.queryAll('.outer_page').length,
+            doc88DiscoveredTexts?.length || 0,
+            (getDoc88TextArray() || []).length
+        );
+        const pages = [];
+        for (let i = 0; i < pageCount; i++) {
+            const pageEl = u.queryAll(select)[i];
+            if (pageEl && isDoc88PageReady(pageEl)) {
+                pageEl.scrollIntoView({ block: 'center' });
+                await u.sleep(350);
+            }
+            const paragraphs = extractDoc88PageText(i, pageEl);
+            if (paragraphs.length) pages.push({ paragraphs, images: [] });
+            await u.preview(i + 1, pageCount);
+        }
+        return pages;
+    };
+
+    const copyFullTextToClipboard = async () => {
+        let pages;
+        if (isDoc88) {
+            u.update('text', '提取正文…');
+            pages = await collectDoc88TextPages();
+        } else {
+            pages = await collectBaiduWordContent();
+        }
+        if (!pages.length) {
+            alert(
+                '未能提取道客巴巴正文。\n\n' +
+                '请先「自动预览」滚完全文；或在页面拖选一段文字点网站「复制」后，再点「复制全文」。'
+            );
+            u.update('text', '无正文');
+            return;
+        }
+        const text = pages
+            .map(p => sanitizeDoc88Paragraphs(p.paragraphs).join('\n'))
+            .filter(Boolean)
+            .join('\n\n');
+        if (!text.trim()) {
+            alert('提取结果为空（可能仅为广告链接）。请完成自动预览后重试。');
+            u.update('text', '无正文');
+            return;
+        }
+        try {
+            await navigator.clipboard.writeText(text);
+            u.update('text', '已复制到剪贴板');
+        } catch (e) {
+            const ta = u.createEl('textarea', PREFIX + 'copybuf');
+            ta.className = PREFIX + 'copyable';
+            ta.value = text;
+            ta.style.cssText = 'position:fixed;left:-9999px';
+            document.body.appendChild(ta);
+            ta.select();
+            document.execCommand('copy');
+            ta.remove();
+            u.update('text', '已复制到剪贴板');
+        }
+    };
+
+    const exportWordAsDoc = (pages) => {
+        let body = '';
+        pages.forEach(page => {
+            const paras = sanitizeDoc88Paragraphs(page.paragraphs);
+            const hasText = paras.length > 0;
+            paras.forEach(para => {
+                const t = String(para).trim();
+                if (t) {
+                    body += '<p style="margin:0 0 10pt;line-height:1.6;font-size:12pt;font-family:宋体,SimSun,serif;mso-line-height-rule:exactly">' +
+                        escapeHtml(t) + '</p>';
+                }
+            });
+            (page.images || []).forEach(img => {
+                if (!img?.dataUrl) return;
+                const w = hasText ? Math.min(img.width || 420, 420) : (img.width || 480);
+                body += '<p style="margin:12pt 0;text-align:center;line-height:normal">' +
+                    '<img src="' + img.dataUrl + '" width="' + w + '" style="max-width:100%"/></p>';
+            });
+            body += '<br clear="all" style="page-break-before:always;mso-break-type:section-break"/>';
+        });
+        const html = '<html xmlns:o="urn:schemas-microsoft-com:office:office" ' +
+            'xmlns:w="urn:schemas-microsoft-com:office:word" ' +
+            'xmlns="http://www.w3.org/TR/REC-html40">' +
+            '<head><meta charset="utf-8"><title>' + escapeHtml(title) + '</title>' +
+            '<!--[if gte mso 9]><xml><w:WordDocument><w:View>Print</w:View></w:WordDocument></xml><![endif]--></head>' +
+            '<body style="font-family:宋体,SimSun,serif;font-size:12pt">' + body + '</body></html>';
+        downloadBlob(new Blob(['\ufeff', html], { type: 'application/msword;charset=utf-8' }), sanitizeTitle(title) + '.doc');
+        return true;
+    };
+
+    const exportWordRich = async (pages) => {
+        const normalized = (pages || []).map(p => ({
+            paragraphs: sanitizeDoc88Paragraphs(p.paragraphs),
+            images: p.images || []
+        }));
+        const valid = normalized.filter(p => p.paragraphs?.length || p.images?.length);
+        const textChars = valid.reduce((n, p) => n + (p.paragraphs || []).join('').length, 0);
+        if (!valid.length) {
+            if (fileType.includes('ppt') || fileType.includes('pdf')) {
+                alert('当前为 PPT/PDF 类型，请使用「下载PDF」或「下载图片」。');
+            } else if (isDoc88) {
+                alert(
+                    '未能提取道客巴巴内容。\n\n请先点击「继续阅读」→「自动预览」滚到底 → 再「下载Word」。\n' +
+                    '可先「导出TXT」或「复制全文」检查文本。'
+                );
+            } else {
+                alert(
+                    '未能提取内容。\n\n请先「展开全文」→「自动预览」滚到底 → 再「下载Word」。\n' +
+                    '可先「导出TXT」检查文本。'
+                );
+            }
+            return false;
+        }
+        const chars = textChars;
+        const imgs = valid.reduce((n, p) => n + (p.images || []).length, 0);
+        console.log('[Word] 导出', valid.length, '页,', chars, '字,', imgs, '图');
+        if (isDoc88 && chars < 20) {
+            alert(
+                '未能提取到可复制正文，已取消导出纯图片 Word。\n\n' +
+                '请：①「继续阅读」②「自动预览」滚到底 ③ 再「下载Word」。\n' +
+                '或在页面选中一段文字点「复制」后，再导出。'
+            );
+            return false;
+        }
+        return exportWordAsDoc(valid);
+    };
+
+    const fullText = async () => {
+        u.update('text', '提取文本…');
+        const pages = isDoc88 ? await collectDoc88TextPages() : await collectBaiduWordContent();
+        if (!pages.length) {
+            alert('没有文本内容，请等待页面加载或先自动预览');
+            u.update('text', '无文本');
+            return;
+        }
+        let text = '';
+        pages.forEach((p, i) => {
+            const paras = sanitizeDoc88Paragraphs(p.paragraphs);
+            if (paras.length) {
+                text += '\n\n====第' + (i + 1) + '页====\n\n' + paras.join('\n');
+            }
+        });
+        if (!text.trim()) {
+            alert('未能提取正文，请先自动预览滚完全文');
+            u.update('text', '无文本');
+            return;
+        }
+        downloadBlob(new Blob([text], { type: 'text/plain;charset=utf-8' }), sanitizeTitle(title) + '.txt');
+        u.update('text', 'TXT 已导出');
+    };
+
+    const downtxt = () => {
+        const images = JSON.parse(GM_getValue('listData') || '[]');
+        const text = images.map(item => item.src).join('\n');
+        downloadBlob(new Blob([text], { type: 'text/plain;charset=utf-8' }), sanitizeTitle(title) + '_urls.txt');
+    };
+
+    const downpdf = () => pdfDoc.save(sanitizeTitle(title) + '.pdf', { returnPromise: true });
+
+    const downzip = () => {
+        zipWriter.close().then(blob => downloadBlob(blob, sanitizeTitle(title) + '.zip'))
+            .catch(e => console.error(e));
+    };
+
+    const conditionDownload = () => {
+        if (downType === 1) {
+            downpdf();
+            localStorage.setItem('down', '1');
+        } else if (downType === 2) {
+            downzip();
+            localStorage.setItem('down', '1');
+        }
+        u.update('text', '下载完成');
+    };
+
+    const parseImage = async () => {
+        const images = u.queryAll(select);
+        if (!images.length) {
+            alert('暂无画布数据，请先自动预览');
+            return;
+        }
+        const listData = [];
+        images.forEach(item => {
+            let src = u.attr(item, 'data-src') || item.src;
+            if (!src) return;
+            if (src.startsWith('//')) src = 'https:' + src;
+            if (src.startsWith('http:') && location.protocol === 'https:') src = src.replace('http:', 'https:');
+            listData.push({ src, page: listData.length });
+        });
+        const store = JSON.stringify(listData);
+        GM_setValue('listData', store);
+        localStorage.setItem('listData', store);
+        localStorage.removeItem('current');
+        await downimg();
+    };
+
+    const parentMessage = (src, frameId) => {
+        const frame = document.getElementById(frameId);
+        frame?.contentWindow?.postMessage({ type: 'parent', value: src }, '*');
+    };
+
+    const downimg = async () => {
+        const images = JSON.parse(GM_getValue('listData') || '[]');
+        const length = images.length;
+        if (!length) {
+            alert('没有图片地址，请等待文档加载或先自动预览');
+            return;
+        }
+        localStorage.setItem('length', String(length));
+        let current = Number(localStorage.getItem('current') || '0');
+
+        for (let index = current; index < length; index++) {
+            const src = images[index].src;
+            const srcHost = new URL(src, location.href).host;
+            const sameOrigin = src.includes('baidu.com') || src.includes(host);
+
+            if (!sameOrigin) {
+                const frameId = 'frame_' + srcHost.replace(/\./g, '_');
+                let frame = document.getElementById(frameId);
+                if (!frame) {
+                    frame = u.createEl('iframe', frameId);
+                    frame.src = new URL(src).origin + '?custom=true';
+                    frame.style.cssText = 'visibility:hidden;width:0;height:0;border:0';
+                    document.body.appendChild(frame);
+                }
+                localStorage.setItem('current', String(index));
+                await u.preview(index, length);
+                parentMessage(src, frameId);
+                return;
+            }
+
+            try {
+                const { uint8, blob, width, height } = await MF_ImageToBase64(src);
+                if (fileType.includes('ppt') || width > height) {
+                    pdfDoc.addPage([width * pdfRatio, height * pdfRatio], 'l');
+                    pdfDoc.addImage(uint8, 'JPEG', 0, 0, width * pdfRatio, height * pdfRatio, index, 'FAST');
+                } else {
+                    pdfDoc.addPage();
+                    pdfDoc.addImage(uint8, 'JPEG', 0, 0, pdfW, pdfH, index, 'FAST');
+                }
+                if (index === 1) pdfDoc.deletePage(1);
+                zipWriter.add(index + '.png', new zip.BlobReader(blob));
+                await u.preview(index + 1, length);
+            } catch (e) {
+                console.warn('图片失败', src, e);
+            }
+            current = index;
+        }
+
+        if (localStorage.getItem('current')) return;
+        if (current === length - 1) conditionDownload();
+    };
+
+    const scrollWinArea = () => {
+        before();
+        const scrollTop = dom.scrollTop;
+        const height = dom.scrollHeight - dom.clientHeight;
+        if (height <= scrollTop + 5) {
+            stopPreview();
+            u.preview(-1);
+            return;
+        }
+        dom.scrollTo({ top: scrollTop + 500, left: 0, behavior: 'smooth' });
+        u.preview(scrollTop, height);
+        accumulateVisiblePages();
+    };
+
+    /** 按页滚动并缓存（避免虚拟列表只保留 2 页 DOM） */
+    const scrollPreviewBaidu = async () => {
+        if (!localStorage.getItem('start')) {
+            u.preview(-1, null, '已终止');
+            return;
+        }
+        before();
+        const i = Number(localStorage.getItem('SP_index') || '0');
+        const childrens = u.queryAll(select);
+        const current = childrens[i];
+        const length = childrens.length;
+        if (!current) {
+            stopPreview();
+            u.preview(-1);
+            return;
+        }
+        const pageHost = current.parentElement || current;
+        let canvas = current.tagName === 'CANVAS' ? current : pageHost.querySelector('canvas');
+        if (!canvas) canvas = pageHost.querySelector('.canvasWrapper canvas');
+        const textLayer = pageHost.querySelector('.textLayer') ||
+            current.closest('#original-creader-root')?.querySelector('.textLayer');
+        const dataLoaded = pageHost.getAttribute?.('data-loaded');
+        if ((dataLoaded || isElementInViewport(pageHost)) && (canvas || textLayer)) {
+            accumulatePageAtIndex(i, textLayer, canvas);
+            if (i < length - 1) {
+                const nextHost = childrens[i + 1].parentElement || childrens[i + 1];
+                nextHost?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            }
+        } else {
+            pageHost.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        }
+        await u.preview(i + 1, length);
+        if (i < length - 1) {
+            localStorage.setItem('SP_index', String(i + 1));
+            setTimeout(scrollPreviewBaidu, 500);
+        } else {
+            u.preview(-1);
+            localStorage.removeItem('SP_index');
+            localStorage.removeItem('start');
+            console.log('[百度文库] 预览完成, 已缓存', Object.keys(loadWordPageCache()).length, '页');
+        }
+    };
+
+    const cacheVisibleTextLayers = () => {
+        accumulateVisiblePages();
+    };
+
+    const stopPreview = () => {
+        if (interval) {
+            clearInterval(interval);
+            interval = null;
+        }
+        localStorage.removeItem('start');
+    };
+
+    const autoPreview = async () => {
+        if (interval) return;
+        localStorage.setItem('start', '1');
+        localStorage.removeItem('SP_index');
+        dom.scrollTop = 0;
+        before();
+        if (isDoc88) {
+            const pages = u.queryAll(select).length;
+            if (pages > 0) {
+                await scrollPreviewDoc88Tick();
+            } else {
+                interval = setInterval(scrollPageAreaDoc88, 500);
+            }
+            return;
+        }
+        const canvasCount = u.queryAll(select).length;
+        if (canvasCount > 0 && (fileType.includes('word') || fileType.includes('doc'))) {
+            await scrollPreviewBaidu();
+            return;
+        }
+        interval = setInterval(scrollWinArea, 500);
+    };
+
+    const executeDownload = async (type) => {
+        downType = type;
+        if (localStorage.getItem('down') && type !== 3) {
+            conditionDownload();
+            return;
+        }
+        u.update('text', '准备下载…');
+        try {
+            if (type === 3) {
+                if (isDoc88) {
+                    syncDoc88CoreTextsToCache();
+                    const pages = await collectDoc88WordContent();
+                    const ok = await exportWordRich(pages);
+                    u.update('text', ok ? 'Word 下载完成' : 'Word 导出失败');
+                } else {
+                    syncPageDataFromReader();
+                    const pages = await collectBaiduWordContent();
+                    const ok = await exportWordRich(pages);
+                    u.update('text', ok ? 'Word 下载完成' : 'Word 导出失败');
+                }
+                return;
+            }
+            if (isDoc88) {
+                await parseImageDoc88();
+                return;
+            }
+            resetWriters();
+            const display = u.query('#app-top-right-tool')?.style.display;
+            if (!display || display === 'none') {
+                await parseImage();
+            } else {
+                conditionDownload();
+            }
+        } catch (err) {
+            console.error(err);
+            alert('下载失败：' + (err.message || err));
+            u.update('text', '下载失败');
+        }
+    };
+
+    const handleRenderData = () => {
+        const pd = unsafeWindow.pageData;
+        if (!pd?.readerInfo) return;
+        const { readerInfo, viewBiz } = pd;
+        fileType = (viewBiz?.docInfo?.fileType || fileType).toLowerCase();
+        title = sanitizeTitle(viewBiz?.docInfo?.aiQueryTitle || title);
+        readerInfoBai = readerInfo;
+        const htmlUrls = readerInfo.htmlUrls;
+        if (htmlUrls) {
+            if (fileType.includes('ppt')) {
+                MF_addURL(htmlUrls);
+            } else if (fileType.includes('pdf')) {
+                let images = htmlUrls.png
+                    ? htmlUrls.png.map(item => item.pageLoadUrl)
+                    : htmlUrls;
+                MF_addURL(images);
+            }
+            if (htmlUrls.json) {
+                MF_addURL(htmlUrls.json.map(item => item.pageLoadUrl), 'pageData');
+            }
+            if (htmlUrls.png?.length) {
+                MF_addURL(htmlUrls.png.map(item => item.pageLoadUrl));
+            }
+        }
+        if (fileType === 'txt' && readerInfoBai) {
+            const { docId, freePage, rsign, showPage, md5sum } = readerInfoBai;
+            const urls = [];
+            for (let i = 1; i < showPage + 1; i++) {
+                const x = md5sum.substring(1);
+                const n = ['pn=' + i, 'rn=1', 'type=txt', 'spr=0', 'rsign=' + rsign, 'callback=wenku_' + i].join('&');
+                urls.push(BASE_URL + '/text/' + docId + '?' + x + '&' + n);
+            }
+            MF_addURL(urls, 'pageData');
+        }
+    };
+
+    const hookBaiduXhr = () => {
+        const _open = unsafeWindow.XMLHttpRequest.prototype.open;
+        unsafeWindow.XMLHttpRequest.prototype.open = function (...args) {
+            const reqUrl = String(args[1] || '');
+            this.addEventListener('load', () => {
+                try {
+                    capturePageUrlFromXhr(reqUrl);
+                    const url = reqUrl;
+                    if (!url.includes('ndocview/readerinfo')) return;
+                    const { data } = JSON.parse(this.responseText);
+                    readerInfoBai = data;
+                    if (data.fileType) fileType = String(data.fileType).toLowerCase();
+                    const htmlUrls = data.htmlUrls;
+                    if (!htmlUrls) return;
+                    let images = htmlUrls.png
+                        ? htmlUrls.png.map(item => item.pageLoadUrl)
+                        : htmlUrls;
+                    if (htmlUrls.json) {
+                        MF_addURL(htmlUrls.json.map(item => item.pageLoadUrl), 'pageData');
+                    }
+                    if (fileType === 'txt') {
+                        const { docId, freePage, rsign, md5sum } = data;
+                        const urls = [];
+                        const start = (readerInfoBai?.showPage || 0) + 1;
+                        for (let i = start; i < freePage + 1; i++) {
+                            const x = md5sum.substring(1);
+                            const n = ['pn=' + i, 'rn=1', 'type=txt', 'spr=0', 'rsign=' + rsign, 'callback=wenku_' + i].join('&');
+                            urls.push(BASE_URL + '/text/' + docId + '?' + x + '&' + n);
+                        }
+                        MF_addURL(urls, 'pageData');
+                    }
+                    MF_addURL(images);
+                } catch (e) { /* ignore */ }
+            });
+            return _open.apply(this, args);
+        };
+    };
+
+    const initDoc88 = () => {
+        if (!/doc88\.com\/.+/.test(href)) return;
+        dom = document.documentElement;
+        title = sanitizeTitle(u.query('meta[property="og:title"]')?.content || document.title);
+        const attrLine = u.query('#box1 .attribute')?.innerText || '';
+        const typePart = attrLine.split(/[：:]/).pop();
+        fileType = (typePart || 'doc').trim().toLowerCase();
+        beforeFun = "let eb=u.query('#continueButton');if(eb)eb.click();";
+        select = '#pageContainer .inner_page, #pageContainer canvas[id^="page_"]';
+        enableDoc88Copy();
+        hookDoc88Xhr();
+        hookDoc88CopyCapture();
+        hookDoc88TextArray();
+
+        const buttons = [
+            { id: 'text', label: '状态 0%' },
+            { id: 'start', label: '自动预览' },
+            { id: 'stop', label: '停止预览' },
+            { id: 'down', label: '下载图片' },
+            { id: 'pdf', label: '下载PDF' },
+            { id: 'word', label: '下载Word' },
+            { id: 'txt', label: '导出TXT' },
+            { id: 'copy', label: '复制全文' }
+        ];
+        const handlers = {
+            start: () => autoPreview(),
+            stop: () => stopPreview(),
+            down: () => executeDownload(2),
+            pdf: () => executeDownload(1),
+            word: () => executeDownload(3),
+            txt: () => fullText(),
+            copy: () => copyFullTextToClipboard()
+        };
+        u.gui(buttons, handlers);
+        ['copy', 'selectstart', 'contextmenu'].forEach(evt => {
+            document.addEventListener(evt, (e) => e.stopImmediatePropagation(), true);
+        });
+        console.log('[道客巴巴] 标题:', title, '类型:', fileType);
+    };
+
+    const initBaidu = () => {
+        if (!/wenku\.baidu\.com\/(tfview|view)/.test(href)) return;
+        dom = u.query('.reader-wrap') || document.documentElement;
+        handleRenderData();
+
+        const buttons = [
+            { id: 'text', label: '状态 0%' },
+            { id: 'start', label: '自动预览' },
+            { id: 'stop', label: '停止预览' },
+            { id: 'down', label: '下载图片' },
+            { id: 'pdf', label: '下载PDF' },
+            { id: 'word', label: '下载Word' },
+            { id: 'txt', label: '导出TXT' },
+            { id: 'copy', label: '复制全文' }
+        ];
+        const handlers = {
+            start: () => autoPreview(),
+            stop: () => stopPreview(),
+            down: () => executeDownload(2),
+            pdf: () => executeDownload(1),
+            word: () => executeDownload(3),
+            txt: () => fullText(),
+            copy: () => copyFullTextToClipboard()
+        };
+        if (fileType.includes('ppt') || fileType.includes('pdf')) {
+            buttons.push({ id: 'urls', label: '获取地址' });
+            handlers.urls = () => downtxt();
+        }
+        buttons.push({ id: 'print', label: '打印PDF' });
+        handlers.print = () => window.print();
+
+        u.gui(buttons, handlers);
+        console.log('[百度文库] 标题:', title, '类型:', fileType);
+    };
+
+    // 子页面：bdimg CDN 拉图（仅百度）
+    if (isChild && params.get('custom')) {
+        window.parent.postMessage({ type: 'onload', value: 'success' }, '*');
+        window.addEventListener('message', async (e) => {
+            if (e.data?.type === 'parent' && e.data.value) {
+                try {
+                    const data = await MF_ImageToBase64(e.data.value);
+                    window.parent.postMessage({ type: 'child', value: data }, '*');
+                } catch (err) {
+                    console.error(err);
+                }
+            }
+        });
+        return;
+    }
+
+    if (isBaidu && host.includes('wenku.baidu.com')) {
+        hookBaiduXhr();
+        clearCache();
+        if (href.includes('tfview') || href.includes('view')) {
+            GM_deleteValue('listData');
+            setTimeout(handleRenderData, 800);
+        }
+        setTimeout(initBaidu, 1200);
+    }
+
+    if (isDoc88) {
+        clearCache();
+        enableDoc88Copy();
+        hookDoc88Xhr();
+        hookDoc88CopyCapture();
+        setTimeout(() => {
+            enableDoc88Copy();
+            hookDoc88CopyCapture();
+            hookDoc88TextArray();
+            deepScanCoreForPageTexts();
+            initDoc88();
+        }, 1200);
+        setInterval(() => {
+            enableDoc88Copy();
+            hookDoc88CopyCapture();
+            hookDoc88TextArray();
+        }, 3000);
+    }
+
+    window.addEventListener('message', async (e) => {
+        if (!isBaidu) return;
+        if (e.data?.type !== 'child' || !e.data.value) return;
+        const index = Number(localStorage.getItem('current') || '0');
+        const { blob, uint8, width, height } = e.data.value;
+        if (width > height) {
+            pdfDoc.addPage([width * pdfRatio, height * pdfRatio], 'l');
+            pdfDoc.addImage(uint8, 'JPEG', 0, 0, width * pdfRatio, height * pdfRatio, index, 'FAST');
+        } else {
+            pdfDoc.addPage();
+            pdfDoc.addImage(uint8, 'JPEG', 0, 0, pdfW, pdfH, index, 'FAST');
+        }
+        if (index === 1) pdfDoc.deletePage(1);
+        zipWriter.add(index + '.png', new zip.BlobReader(blob));
+        localStorage.setItem('current', String(index + 1));
+        downimg();
+    });
+})();

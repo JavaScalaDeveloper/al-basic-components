@@ -14,5 +14,6 @@ source ~/.zshenv
 #source ~/.bash_profile
 #echo ${ALIYUN_SMS_ACCESS_KEY_ID}
 
-export ARELORE_MYSQL_USERNAME="root"
-export ARELORE_MYSQL_PASSWORD=""
+export ALI_BAILIAN_DASHSCOPE_API_KEY="sk-9ef8bc08b0bb45bb85dabf30d1f53e96"
+export WECHAT_MINI_SECRET="503602f92c8dc217226b23f068b984bf"
+

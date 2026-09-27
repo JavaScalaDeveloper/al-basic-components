@@ -10,7 +10,7 @@ CREATE TABLE IF NOT EXISTS `user_detect_result`
     `user_id`               varchar(64)  not null default '' comment '用户ID',
     `user_detect_type_code` varchar(64)  not null default '' comment '检测类型编码',
     `user_detect_result`    varchar(255) not null default '' comment '检测结果',
-    `extra_info`            text                  default null comment '拓展信息(JSON，含每题标题与选项内容等)',
+    `extra_info`            mediumtext            default null comment '拓展信息(JSON，含每题标题与选项内容等)',
     primary key (`id`),
     unique key `uk_type_user` (`user_detect_type_code`, `user_id`),
     key `idx_user_id` (`user_id`),
@@ -28,10 +28,13 @@ CREATE TABLE IF NOT EXISTS `user_detect_result_history`
     `user_id`               varchar(64)  not null default '' comment '用户ID',
     `user_detect_type_code` varchar(64)  not null default '' comment '检测类型编码',
     `user_detect_result`    varchar(255) not null default '' comment '检测结果',
-    `extra_info`            text                  default null comment '拓展信息(JSON，含每题标题与选项内容等)',
+    `extra_info`            mediumtext            default null comment '拓展信息(JSON，含每题标题与选项内容等)',
     primary key (`id`),
     key `idx_user_id` (`user_id`),
     key `idx_type_code` (`user_detect_type_code`),
     key `idx_create_time` (`create_time`)
 ) engine = InnoDB
   default charset = utf8mb4 comment ='用户历史检测结果表';
+
+select * from user_detect_result;
+select * from user_detect_result_history;

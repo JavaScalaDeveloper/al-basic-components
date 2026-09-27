@@ -14,7 +14,7 @@ CREATE TABLE `user_detection_type`
     `type_code`        varchar(64)                            not null default '' comment '检测类型Code',
     `type_name`        varchar(255)                           not null default '' comment '检测类型名',
     `type_description` varchar(255) default '' comment '检测类型描述',
-    `extra_info`       text         default null comment '拓展信息(JSON格式)',
+    `extra_info`       mediumtext   default null comment '拓展信息(JSON格式)',
     primary key (`id`),
     unique key `uk_type_code` (`type_code`)
 ) engine = InnoDB
@@ -32,8 +32,8 @@ CREATE TABLE `user_detection_question`
     `question_name`        varchar(255) not null default '' comment '题目名称',
     `question_order`       int          not null default 0 comment '题目排序编号',
     `question_description` varchar(255)          default '' comment '题目描述',
-    `options`              text                  default null comment '选项',
-    `extra_info`           text                  default null comment '拓展信息(JSON格式)',
+    `options`              mediumtext            default null comment '选项',
+    `extra_info`           mediumtext            default null comment '拓展信息(JSON格式)',
     primary key (`id`),
     unique key `uk_type_question_code` (`type_code`, `question_code`)
 ) engine = InnoDB
