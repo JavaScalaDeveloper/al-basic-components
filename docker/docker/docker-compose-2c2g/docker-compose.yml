@@ -21,6 +21,7 @@ services:
     command:
       - --character-set-server=utf8mb4
       - --collation-server=utf8mb4_unicode_ci
+      - --binlog_expire_logs_seconds=259200   # 3 天
 
   # MySQL 8.0 (测试环境)
   mysql-test:
@@ -41,6 +42,7 @@ services:
     command:
       - --character-set-server=utf8mb4
       - --collation-server=utf8mb4_unicode_ci
+      - --binlog_expire_logs_seconds=259200   # 3 天
 
   # Ollama (本地大模型服务)
 #  docker compose up -d ollama

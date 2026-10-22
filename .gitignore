@@ -1,3 +1,9 @@
 /.idea/
 /test/
 /office/doc/temp/
+
+# 本机生成媒体：输出、虚拟环境、本地下载的模型权重
+local/**/outputs/
+local/**/.venv/
+local/diffusers-image/sd15/
+local/wan21-video/Wan2.1*/

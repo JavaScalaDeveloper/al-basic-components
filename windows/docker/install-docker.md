@@ -1,6 +1,8 @@
-# Windows 从 0 到 1 安装 Docker
+# Windows 下安装 Docker
 
-本文说明在 **Windows 10 / 11** 上如何从零安装并验证 Docker Desktop，以便运行本目录下的 `docker-compose` 等脚本。
+本文说明在 **Windows 10 / 11** 上如何从零安装并验证 Docker Desktop，以便运行本仓库 `docker/` 下的脚本与编排。
+
+返回目录：[Windows 文档首页](../README.md)
 
 ---
 
@@ -119,7 +121,7 @@ docker ps
 }
 ```
 
-点击 **Apply & Restart**。本仓库 `docker-compose.yml` 中已有部分镜像使用了 DaoCloud 前缀，可与上述加速配合使用。
+点击 **Apply & Restart**。本仓库部分镜像已使用 DaoCloud 前缀，可与上述加速配合使用。
 
 ---
 
